@@ -1,0 +1,1521 @@
+(function (Scratch) {
+"use strict";
+
+if (!Scratch || !Scratch.extensions || !Scratch.extensions.unsandboxed) {
+    throw new Error("3Dimensioner zahteva Unsandboxed režim.");
+}
+
+const EXTENSION_COLOR = "#516499";
+const VERSION = "1.2";
+
+const state = {
+    models: [],
+    camera: {
+        x: 0, y: 0, z: 6,
+        rx: 0, ry: 0, rz: 0
+    },
+    fps: 60,
+    running: true,
+    gl: null,
+    canvas: null,
+    stage: null,
+    program: null,
+    locations: null,
+    lastFrame: 0,
+    frameInterval: 1000 / 60,
+    status: "Spreman",
+    editor: null,
+    overlay: null,
+    fileInput: null,
+    nextId: 1
+};
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const num = v => Number.isFinite(Number(v)) ? Number(v) : 0;
+const rad = v => num(v) * Math.PI / 180;
+
+function setStatus(message) {
+    state.status = String(message);
+    if (state.statusElement) {
+        state.statusElement.textContent = state.status;
+    }
+}
+
+function uniqueName(name) {
+    let base = String(name || "Model").replace(/\.[^.]+$/, "");
+    if (!base) base = "Model";
+
+    let candidate = base;
+    let i = 2;
+
+    while (state.models.some(m => m.name.toLowerCase() === candidate.toLowerCase())) {
+        candidate = base + " (" + i++ + ")";
+    }
+
+    return candidate;
+}
+
+function axisValue(obj, axis, prefix) {
+    const key = prefix + axis.toUpperCase();
+    return obj[key] ?? 0;
+}
+
+/* =====================================================
+   ZIP READER
+   Supports standard ZIP central directory:
+   STORE and DEFLATE entries.
+===================================================== */
+
+async function readZip(file) {
+    const buffer = await file.arrayBuffer();
+    const view = new DataView(buffer);
+    const bytes = new Uint8Array(buffer);
+
+    const u16 = p => view.getUint16(p, true);
+    const u32 = p => view.getUint32(p, true);
+
+    let eocd = -1;
+    const searchStart = Math.max(0, bytes.length - 65557);
+
+    for (let p = bytes.length - 22; p >= searchStart; p--) {
+        if (u32(p) === 0x06054b50) {
+            eocd = p;
+            break;
+        }
+    }
+
+    if (eocd < 0) {
+        throw new Error("ZIP nema ispravan central directory.");
+    }
+
+    const count = u16(eocd + 10);
+    let cursor = u32(eocd + 16);
+
+    const files = new Map();
+
+    for (let i = 0; i < count; i++) {
+        if (cursor + 46 > bytes.length || u32(cursor) !== 0x02014b50) {
+            throw new Error("Oštećen ZIP central directory.");
+        }
+
+        const flags = u16(cursor + 8);
+        const method = u16(cursor + 10);
+        const compressedSize = u32(cursor + 20);
+        const uncompressedSize = u32(cursor + 24);
+        const nameLength = u16(cursor + 28);
+        const extraLength = u16(cursor + 30);
+        const commentLength = u16(cursor + 32);
+        const localOffset = u32(cursor + 42);
+
+        const nameBytes = bytes.slice(cursor + 46, cursor + 46 + nameLength);
+        const name = new TextDecoder().decode(nameBytes).replace(/\\/g, "/");
+
+        cursor += 46 + nameLength + extraLength + commentLength;
+
+        if (name.endsWith("/")) continue;
+        if (flags & 1) throw new Error("ZIP je šifrovan i ne može se otvoriti.");
+
+        if (localOffset + 30 > bytes.length || u32(localOffset) !== 0x04034b50) {
+            throw new Error("Neispravan ZIP lokalni zapis.");
+        }
+
+        const localNameLength = u16(localOffset + 26);
+        const localExtraLength = u16(localOffset + 28);
+        const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+        const compressed = bytes.slice(dataStart, dataStart + compressedSize);
+
+        let result;
+
+        if (method === 0) {
+            result = compressed;
+        } else if (method === 8) {
+            if (typeof DecompressionStream === "undefined") {
+                throw new Error("Ovaj browser nema DEFLATE podršku za ZIP.");
+            }
+
+            try {
+                const stream = new Blob([compressed])
+                    .stream()
+                    .pipeThrough(new DecompressionStream("deflate-raw"));
+
+                result = new Uint8Array(await new Response(stream).arrayBuffer());
+            } catch (e) {
+                throw new Error("Ne mogu da raspakujem " + name + ". Probaj standardni ZIP.");
+            }
+        } else {
+            throw new Error("Nepodržana ZIP kompresija: " + method);
+        }
+
+        if (result.length !== uncompressedSize) {
+            throw new Error("Veličina ZIP fajla nije ispravna: " + name);
+        }
+
+        files.set(name.toLowerCase(), {
+            name,
+            data: result
+        });
+    }
+
+    return files;
+}
+
+function findZipFile(files, wanted, parentPath = "") {
+    if (!wanted) return null;
+
+    const clean = wanted.replace(/\\/g, "/").replace(/^\/+/, "");
+    const full = (parentPath + clean).toLowerCase();
+
+    if (files.has(full)) return files.get(full);
+
+    const basename = clean.split("/").pop().toLowerCase();
+
+    for (const [key, value] of files) {
+        if (key === basename || key.endsWith("/" + basename)) {
+            return value;
+        }
+    }
+
+    return null;
+}
+
+/* =====================================================
+   MATERIAL LIBRARY PARSER
+===================================================== */
+
+function parseMTL(text, mtlPath, files) {
+    const materials = {};
+    let current = null;
+
+    const lines = text.split(/\r?\n/);
+
+    for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith("#")) continue;
+
+        const parts = line.split(/\s+/);
+        const command = parts.shift();
+
+        if (command === "newmtl") {
+            const name = parts.join(" ");
+            current = {
+                name,
+                color: [0.8, 0.8, 0.8],
+                alpha: 1,
+                texture: null
+            };
+            materials[name] = current;
+        } else if (!current) {
+            continue;
+        } else if (command === "Kd") {
+            current.color = [
+                clamp(num(parts[0]), 0, 1),
+                clamp(num(parts[1]), 0, 1),
+                clamp(num(parts[2]), 0, 1)
+            ];
+        } else if (command === "d") {
+            current.alpha = clamp(num(parts[0]), 0, 1);
+        } else if (command === "Tr") {
+            current.alpha = 1 - clamp(num(parts[0]), 0, 1);
+        } else if (command === "map_Kd") {
+            let textureName = parts.join(" ");
+
+            // Preskoči uobičajene MTL map opcije.
+            while (textureName.startsWith("-")) {
+                const tokens = textureName.split(/\s+/);
+                const option = tokens.shift();
+
+                const counts = {
+                    "-blendu": 1, "-blendv": 1, "-boost": 1,
+                    "-mm": 2, "-o": 3, "-s": 3,
+                    "-t": 3, "-texres": 1, "-clamp": 1,
+                    "-bm": 1, "-imfchan": 1, "-type": 1
+                };
+
+                const skip = counts[option] ?? 1;
+                tokens.splice(0, skip);
+                textureName = tokens.join(" ");
+            }
+
+            const folder = mtlPath.includes("/")
+                ? mtlPath.slice(0, mtlPath.lastIndexOf("/") + 1)
+                : "";
+
+            const texture = findZipFile(files, textureName, folder);
+
+            if (texture) {
+                current.texture = texture;
+            }
+        }
+    }
+
+    return materials;
+}
+
+/* =====================================================
+   OBJ PARSER
+   - vertices, UV, normals
+   - negative indices
+   - polygon triangulation
+   - material groups
+   - vertex colors
+===================================================== */
+
+function parseOBJ(text, files, objPath) {
+    const positions = [];
+    const texcoords = [];
+    const normals = [];
+    const vertexColors = [];
+
+    const materialLibraries = [];
+    const triangles = [];
+
+    let currentMaterial = "__default";
+    let min = [Infinity, Infinity, Infinity];
+    let max = [-Infinity, -Infinity, -Infinity];
+
+    const resolveIndex = (value, length) => {
+        const n = parseInt(value, 10);
+        if (!Number.isFinite(n) || n === 0) return -1;
+        return n > 0 ? n - 1 : length + n;
+    };
+
+    const lines = text.split(/\r?\n/);
+
+    for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith("#")) continue;
+
+        const parts = line.split(/\s+/);
+        const command = parts.shift();
+
+        if (command === "v") {
+            const x = num(parts[0]);
+            const y = num(parts[1]);
+            const z = num(parts[2]);
+
+            positions.push([x, y, z]);
+
+            min[0] = Math.min(min[0], x);
+            min[1] = Math.min(min[1], y);
+            min[2] = Math.min(min[2], z);
+
+            max[0] = Math.max(max[0], x);
+            max[1] = Math.max(max[1], y);
+            max[2] = Math.max(max[2], z);
+
+            if (parts.length >= 6) {
+                vertexColors.push([
+                    clamp(num(parts[3]), 0, 1),
+                    clamp(num(parts[4]), 0, 1),
+                    clamp(num(parts[5]), 0, 1)
+                ]);
+            } else {
+                vertexColors.push(null);
+            }
+        } else if (command === "vt") {
+            texcoords.push([num(parts[0]), num(parts[1])]);
+        } else if (command === "vn") {
+            normals.push([num(parts[0]), num(parts[1]), num(parts[2])]);
+        } else if (command === "mtllib") {
+            materialLibraries.push(parts.join(" "));
+        } else if (command === "usemtl") {
+            currentMaterial = parts.join(" ") || "__default";
+        } else if (command === "f") {
+            const face = parts.map(token => {
+                const p = token.split("/");
+                return {
+                    v: resolveIndex(p[0], positions.length),
+                    t: p[1] ? resolveIndex(p[1], texcoords.length) : -1,
+                    n: p[2] ? resolveIndex(p[2], normals.length) : -1
+                };
+            });
+
+            if (face.length < 3) continue;
+
+            for (let i = 1; i < face.length - 1; i++) {
+                triangles.push({
+                    corners: [face[0], face[i], face[i + 1]],
+                    material: currentMaterial
+                });
+            }
+        }
+    }
+
+    if (!positions.length || !triangles.length) {
+        throw new Error("OBJ nema validne verteks-e ili face poligone.");
+    }
+
+    const materials = {};
+
+    const objFolder = objPath.includes("/")
+        ? objPath.slice(0, objPath.lastIndexOf("/") + 1)
+        : "";
+
+    for (const library of materialLibraries) {
+        const file = findZipFile(files, library, objFolder);
+        if (file) {
+            const mtlText = new TextDecoder().decode(file.data);
+            Object.assign(materials, parseMTL(mtlText, file.name, files));
+        }
+    }
+
+    if (!materials.__default) {
+        materials.__default = {
+            name: "__default",
+            color: [0.72, 0.75, 0.8],
+            alpha: 1,
+            texture: null
+        };
+    }
+
+    const groups = new Map();
+
+    for (const triangle of triangles) {
+        const name = materials[triangle.material]
+            ? triangle.material
+            : "__default";
+
+        if (!groups.has(name)) groups.set(name, []);
+        groups.get(name).push(triangle);
+    }
+
+    const center = [
+        (min[0] + max[0]) / 2,
+        (min[1] + max[1]) / 2,
+        (min[2] + max[2]) / 2
+    ];
+
+    const extent = Math.max(
+        max[0] - min[0],
+        max[1] - min[1],
+        max[2] - min[2]
+    );
+
+    const scale = extent > 0 ? 2.5 / extent : 1;
+
+    const meshGroups = [];
+
+    for (const [materialName, groupTriangles] of groups) {
+        const material = materials[materialName] || materials.__default;
+
+        const outPositions = [];
+        const outUV = [];
+        const outNormals = [];
+        const outColors = [];
+
+        for (const triangle of groupTriangles) {
+            const pts = triangle.corners.map(c => positions[c.v]);
+
+            const a = pts[0], b = pts[1], c = pts[2];
+
+            const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+            const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+
+            let nx = uy * vz - uz * vy;
+            let ny = uz * vx - ux * vz;
+            let nz = ux * vy - uy * vx;
+
+            const length = Math.hypot(nx, ny, nz) || 1;
+            nx /= length;
+            ny /= length;
+            nz /= length;
+
+            for (let j = 0; j < 3; j++) {
+                const corner = triangle.corners[j];
+                const p = positions[corner.v];
+
+                outPositions.push(
+                    (p[0] - center[0]) * scale,
+                    (p[1] - center[1]) * scale,
+                    (p[2] - center[2]) * scale
+                );
+
+                const uv = corner.t >= 0 ? texcoords[corner.t] : [0, 0];
+                outUV.push(uv[0], uv[1]);
+
+                const normal = corner.n >= 0 ? normals[corner.n] : [nx, ny, nz];
+                const nl = Math.hypot(normal[0], normal[1], normal[2]) || 1;
+
+                outNormals.push(
+                    normal[0] / nl,
+                    normal[1] / nl,
+                    normal[2] / nl
+                );
+
+                const vc = vertexColors[corner.v];
+
+                if (vc) {
+                    outColors.push(vc[0], vc[1], vc[2]);
+                } else {
+                    outColors.push(1, 1, 1);
+                }
+            }
+        }
+
+        meshGroups.push({
+            positions: new Float32Array(outPositions),
+            uv: new Float32Array(outUV),
+            normals: new Float32Array(outNormals),
+            colors: new Float32Array(outColors),
+            material,
+            vertexCount: outPositions.length / 3,
+            textureImage: null
+        });
+    }
+
+    return {
+        meshGroups,
+        bounds: { min, max, center, scale }
+    };
+}
+
+/* =====================================================
+   ZIP MODEL IMPORT
+===================================================== */
+
+async function importZip(file) {
+    setStatus("Raspakujem ZIP...");
+
+    const files = await readZip(file);
+
+    const objFiles = [...files.values()]
+        .filter(entry => entry.name.toLowerCase().endsWith(".obj"));
+
+    if (!objFiles.length) {
+        throw new Error("ZIP ne sadrži nijedan OBJ model.");
+    }
+
+    const selected = objFiles[0];
+
+    setStatus("Učitavam geometriju i materijale...");
+
+    const objText = new TextDecoder().decode(selected.data);
+    const parsed = parseOBJ(objText, files, selected.name);
+
+    const model = {
+        id: state.nextId++,
+        name: uniqueName(selected.name),
+        x: 0, y: 0, z: 0,
+        rx: 0, ry: 0, rz: 0,
+        visible: true,
+        meshGroups: parsed.meshGroups,
+        bounds: parsed.bounds,
+        gpu: [],
+        source: selected.name
+    };
+
+    // Učitavanje svih tekstura pre slanja modela na GPU.
+    setStatus("Učitavam teksture i boje...");
+
+    await Promise.all(
+        model.meshGroups.map(group => loadTextureImage(group))
+    );
+
+    state.models.push(model);
+
+    if (state.gl) {
+        uploadModel(model);
+    }
+
+    setStatus(
+        "Model učitan: " + model.name +
+        " | Materijali: " + model.meshGroups.length
+    );
+
+    refreshModelList();
+
+    return model;
+}
+
+/* =====================================================
+   MODEL TEXTURE LOADING
+===================================================== */
+
+function loadTextureImage(group) {
+    return new Promise(resolve => {
+        if (!group.material.texture) {
+            resolve(null);
+            return;
+        }
+
+        const blob = new Blob([group.material.texture.data]);
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+
+        img.onload = () => {
+            URL.revokeObjectURL(url);
+            group.textureImage = img;
+            resolve(img);
+        };
+
+        img.onerror = () => {
+            URL.revokeObjectURL(url);
+            group.textureImage = null;
+            resolve(null);
+        };
+
+        img.src = url;
+    });
+}
+
+/* =====================================================
+   MATRIX UTILITIES — COLUMN MAJOR
+===================================================== */
+
+function mat4Identity() {
+    return new Float32Array([
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    ]);
+}
+
+function mat4Multiply(a, b) {
+    const out = new Float32Array(16);
+
+    for (let col = 0; col < 4; col++) {
+        for (let row = 0; row < 4; row++) {
+            let sum = 0;
+            for (let k = 0; k < 4; k++) {
+                sum += a[k * 4 + row] * b[col * 4 + k];
+            }
+            out[col * 4 + row] = sum;
+        }
+    }
+
+    return out;
+}
+
+function mat4Translation(x, y, z) {
+    const m = mat4Identity();
+    m[12] = x;
+    m[13] = y;
+    m[14] = z;
+    return m;
+}
+
+function mat4Scale(x, y, z) {
+    const m = mat4Identity();
+    m[0] = x;
+    m[5] = y;
+    m[10] = z;
+    return m;
+}
+
+function mat4RotationX(a) {
+    const c = Math.cos(a), s = Math.sin(a);
+    return new Float32Array([
+        1, 0, 0, 0,
+        0, c, s, 0,
+        0, -s, c, 0,
+        0, 0, 0, 1
+    ]);
+}
+
+function mat4RotationY(a) {
+    const c = Math.cos(a), s = Math.sin(a);
+    return new Float32Array([
+        c, 0, -s, 0,
+        0, 1, 0, 0,
+        s, 0, c, 0,
+        0, 0, 0, 1
+    ]);
+}
+
+function mat4RotationZ(a) {
+    const c = Math.cos(a), s = Math.sin(a);
+    return new Float32Array([
+        c, s, 0, 0,
+        -s, c, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1
+    ]);
+}
+
+function mat4Perspective(fov, aspect, near, far) {
+    const f = 1 / Math.tan(fov / 2);
+    const nf = 1 / (near - far);
+
+    return new Float32Array([
+        f / aspect, 0, 0, 0,
+        0, f, 0, 0,
+        0, 0, (far + near) * nf, -1,
+        0, 0, 2 * far * near * nf, 0
+    ]);
+}
+
+function mat4LookCamera(camera) {
+    let view = mat4Identity();
+
+    view = mat4Multiply(view, mat4RotationX(-rad(camera.rx)));
+    view = mat4Multiply(view, mat4RotationY(-rad(camera.ry)));
+    view = mat4Multiply(view, mat4RotationZ(-rad(camera.rz)));
+    view = mat4Multiply(view, mat4Translation(
+        -camera.x, -camera.y, -camera.z
+    ));
+
+    return view;
+}
+
+/* =====================================================
+   SHADERS
+===================================================== */
+
+const VERTEX_SHADER = `
+attribute vec3 aPosition;
+attribute vec3 aNormal;
+attribute vec2 aUV;
+attribute vec3 aColor;
+
+uniform mat4 uMVP;
+uniform mat4 uModel;
+
+varying vec3 vNormal;
+varying vec2 vUV;
+varying vec3 vColor;
+
+void main() {
+    gl_Position = uMVP * vec4(aPosition, 1.0);
+    vNormal = mat3(uModel) * aNormal;
+    vUV = aUV;
+    vColor = aColor;
+}
+`;
+
+const FRAGMENT_SHADER = `
+precision mediump float;
+
+varying vec3 vNormal;
+varying vec2 vUV;
+varying vec3 vColor;
+
+uniform vec3 uMaterialColor;
+uniform float uAlpha;
+uniform sampler2D uTexture;
+uniform float uUseTexture;
+
+void main() {
+    vec3 normal = normalize(vNormal);
+    vec3 lightDirection = normalize(vec3(0.35, 0.75, 0.6));
+
+    float diffuse = max(dot(normal, lightDirection), 0.0);
+    float lighting = 0.35 + diffuse * 0.65;
+
+    vec4 tex = texture2D(uTexture, vUV);
+    vec3 base = uMaterialColor * vColor;
+
+    if (uUseTexture > 0.5) {
+        base *= tex.rgb;
+    }
+
+    gl_FragColor = vec4(base * lighting, uAlpha * (
+        uUseTexture > 0.5 ? tex.a : 1.0
+    ));
+}
+`;
+
+/* =====================================================
+   END OF PART 1
+   PART 2 CONTINUES DIRECTLY HERE.
+===================================================== */
+
+/* =====================================================
+   WEBGL INITIALIZATION
+===================================================== */
+
+function compileShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        const message = gl.getShaderInfoLog(shader);
+        gl.deleteShader(shader);
+        throw new Error("Shader greška: " + message);
+    }
+
+    return shader;
+}
+
+function createProgram(gl) {
+    const vs = compileShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER);
+    const fs = compileShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER);
+
+    const program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        throw new Error("WebGL program greška: " + gl.getProgramInfoLog(program));
+    }
+
+    return program;
+}
+
+function findStageCanvas() {
+    try {
+        if (Scratch.vm && Scratch.vm.renderer && Scratch.vm.renderer.canvas) {
+            return Scratch.vm.renderer.canvas;
+        }
+
+        if (Scratch.vm && Scratch.vm.runtime &&
+            Scratch.vm.runtime.renderer &&
+            Scratch.vm.runtime.renderer.canvas) {
+            return Scratch.vm.runtime.renderer.canvas;
+        }
+    } catch (e) {}
+
+    return document.querySelector("canvas");
+}
+
+function setupRenderer() {
+    if (state.gl && state.canvas) return true;
+
+    const stage = findStageCanvas();
+    if (!stage || !stage.parentElement) return false;
+
+    state.stage = stage;
+
+    const overlay = document.createElement("canvas");
+    overlay.id = "threedimensioner-overlay";
+
+    Object.assign(overlay.style, {
+        position: "absolute",
+        left: "0",
+        top: "0",
+        width: "100%",
+        height: "100%",
+        pointerEvents: "none",
+        zIndex: "5"
+    });
+
+    const parent = stage.parentElement;
+
+    if (getComputedStyle(parent).position === "static") {
+        parent.style.position = "relative";
+    }
+
+    parent.appendChild(overlay);
+
+    const gl = overlay.getContext("webgl", {
+        alpha: true,
+        antialias: true,
+        depth: true,
+        premultipliedAlpha: false
+    }) || overlay.getContext("experimental-webgl", {
+        alpha: true,
+        antialias: true,
+        depth: true
+    });
+
+    if (!gl) {
+        overlay.remove();
+        throw new Error("WebGL nije dostupan u ovom browseru.");
+    }
+
+    state.overlay = overlay;
+    state.canvas = overlay;
+    state.gl = gl;
+
+    state.program = createProgram(gl);
+
+    state.locations = {
+        position: gl.getAttribLocation(state.program, "aPosition"),
+        normal: gl.getAttribLocation(state.program, "aNormal"),
+        uv: gl.getAttribLocation(state.program, "aUV"),
+        color: gl.getAttribLocation(state.program, "aColor"),
+
+        mvp: gl.getUniformLocation(state.program, "uMVP"),
+        model: gl.getUniformLocation(state.program, "uModel"),
+        materialColor: gl.getUniformLocation(state.program, "uMaterialColor"),
+        alpha: gl.getUniformLocation(state.program, "uAlpha"),
+        texture: gl.getUniformLocation(state.program, "uTexture"),
+        useTexture: gl.getUniformLocation(state.program, "uUseTexture")
+    };
+
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.disable(gl.CULL_FACE);
+
+    for (const model of state.models) {
+        uploadModel(model);
+    }
+
+    resizeRenderer();
+    setStatus("3D renderer spreman");
+
+    return true;
+}
+
+function resizeRenderer() {
+    if (!state.canvas || !state.stage) return;
+
+    const rect = state.stage.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+    const width = Math.max(1, Math.round(rect.width * dpr));
+    const height = Math.max(1, Math.round(rect.height * dpr));
+
+    if (state.canvas.width !== width || state.canvas.height !== height) {
+        state.canvas.width = width;
+        state.canvas.height = height;
+    }
+
+    state.canvas.style.left = state.stage.offsetLeft + "px";
+    state.canvas.style.top = state.stage.offsetTop + "px";
+    state.canvas.style.width = rect.width + "px";
+    state.canvas.style.height = rect.height + "px";
+
+    state.gl.viewport(0, 0, width, height);
+}
+
+/* =====================================================
+   GPU MODEL UPLOAD
+===================================================== */
+
+function createBuffer(gl, data) {
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    return buffer;
+}
+
+function uploadModel(model) {
+    const gl = state.gl;
+    if (!gl) return;
+
+    model.gpu = [];
+
+    for (const group of model.meshGroups) {
+        const gpu = {
+            position: createBuffer(gl, group.positions),
+            normal: createBuffer(gl, group.normals),
+            uv: createBuffer(gl, group.uv),
+            color: createBuffer(gl, group.colors),
+            count: group.vertexCount,
+            texture: null
+        };
+
+        if (group.textureImage) {
+            const texture = gl.createTexture();
+
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+            gl.texImage2D(
+                gl.TEXTURE_2D,
+                0,
+                gl.RGBA,
+                gl.RGBA,
+                gl.UNSIGNED_BYTE,
+                group.textureImage
+            );
+
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+            gpu.texture = texture;
+        }
+
+        model.gpu.push(gpu);
+    }
+}
+
+/* =====================================================
+   MODEL MATRIX
+===================================================== */
+
+function getModelMatrix(model) {
+    let matrix = mat4Identity();
+
+    matrix = mat4Multiply(matrix, mat4Translation(
+        model.x, model.y, model.z
+    ));
+
+    matrix = mat4Multiply(matrix, mat4RotationZ(rad(model.rz)));
+    matrix = mat4Multiply(matrix, mat4RotationY(rad(model.ry)));
+    matrix = mat4Multiply(matrix, mat4RotationX(rad(model.rx)));
+
+    return matrix;
+}
+
+/* =====================================================
+   RENDERING
+===================================================== */
+
+function bindAttribute(gl, location, buffer, size) {
+    if (location < 0) return;
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.enableVertexAttribArray(location);
+    gl.vertexAttribPointer(location, size, gl.FLOAT, false, 0, 0);
+}
+
+function renderFrame(timestamp) {
+    if (!state.running) return;
+
+    if (!state.gl) {
+        try {
+            setupRenderer();
+        } catch (e) {
+            setStatus(e.message);
+        }
+    }
+
+    if (!state.gl) {
+        requestAnimationFrame(renderFrame);
+        return;
+    }
+
+    if (timestamp - state.lastFrame < state.frameInterval - 1) {
+        requestAnimationFrame(renderFrame);
+        return;
+    }
+
+    state.lastFrame = timestamp;
+
+    resizeRenderer();
+
+    const gl = state.gl;
+    const width = state.canvas.width;
+    const height = state.canvas.height;
+
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    gl.useProgram(state.program);
+
+    const projection = mat4Perspective(
+        rad(70),
+        width / Math.max(1, height),
+        0.01,
+        1000
+    );
+
+    const view = mat4LookCamera(state.camera);
+
+    for (const model of state.models) {
+        if (!model.visible || !model.gpu.length) continue;
+
+        const modelMatrix = getModelMatrix(model);
+        const viewModel = mat4Multiply(view, modelMatrix);
+        const mvp = mat4Multiply(projection, viewModel);
+
+        gl.uniformMatrix4fv(state.locations.mvp, false, mvp);
+        gl.uniformMatrix4fv(state.locations.model, false, modelMatrix);
+
+        for (let i = 0; i < model.gpu.length; i++) {
+            const gpu = model.gpu[i];
+            const group = model.meshGroups[i];
+            const material = group.material;
+
+            bindAttribute(gl, state.locations.position, gpu.position, 3);
+            bindAttribute(gl, state.locations.normal, gpu.normal, 3);
+            bindAttribute(gl, state.locations.uv, gpu.uv, 2);
+            bindAttribute(gl, state.locations.color, gpu.color, 3);
+
+            gl.uniform3fv(
+                state.locations.materialColor,
+                new Float32Array(material.color || [0.8, 0.8, 0.8])
+            );
+
+            gl.uniform1f(state.locations.alpha, material.alpha ?? 1);
+
+            if (gpu.texture) {
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, gpu.texture);
+                gl.uniform1i(state.locations.texture, 0);
+                gl.uniform1f(state.locations.useTexture, 1);
+            } else {
+                gl.uniform1f(state.locations.useTexture, 0);
+            }
+
+            gl.drawArrays(gl.TRIANGLES, 0, gpu.count);
+        }
+    }
+
+    requestAnimationFrame(renderFrame);
+}
+
+/* =====================================================
+   EDITOR UI
+===================================================== */
+
+function createEditor() {
+    if (state.editor) return;
+
+    const root = document.createElement("div");
+    root.id = "threedimensioner-editor";
+
+    Object.assign(root.style, {
+        position: "fixed",
+        right: "16px",
+        bottom: "16px",
+        width: "300px",
+        maxHeight: "65vh",
+        overflowY: "auto",
+        zIndex: "999999",
+        background: "#202735",
+        color: "#f4f6ff",
+        border: "1px solid #516499",
+        borderRadius: "12px",
+        padding: "12px",
+        fontFamily: "Arial, sans-serif",
+        fontSize: "13px",
+        boxShadow: "0 8px 30px rgba(0,0,0,.35)"
+    });
+
+    const title = document.createElement("div");
+    title.textContent = "3Dimensioner 1.2";
+    Object.assign(title.style, {
+        fontWeight: "bold",
+        fontSize: "16px",
+        marginBottom: "10px"
+    });
+
+    const addButton = document.createElement("button");
+    addButton.textContent = "+ Add Model (.ZIP)";
+    styleButton(addButton);
+    addButton.style.width = "100%";
+
+    const listTitle = document.createElement("div");
+    listTitle.textContent = "Models";
+    listTitle.style.marginTop = "14px";
+    listTitle.style.fontWeight = "bold";
+
+    const list = document.createElement("div");
+    list.style.marginTop = "6px";
+
+    const status = document.createElement("div");
+    status.textContent = "Spreman";
+    Object.assign(status.style, {
+        marginTop: "12px",
+        color: "#b9c8ff",
+        overflowWrap: "anywhere",
+        fontSize: "12px"
+    });
+
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = ".zip,application/zip";
+    fileInput.style.display = "none";
+
+    addButton.addEventListener("click", () => fileInput.click());
+
+    fileInput.addEventListener("change", async () => {
+        const file = fileInput.files && fileInput.files[0];
+        if (!file) return;
+
+        try {
+            await importZip(file);
+        } catch (e) {
+            console.error("[3Dimensioner]", e);
+            setStatus("Greška: " + e.message);
+        }
+
+        fileInput.value = "";
+    });
+
+    const closeButton = document.createElement("button");
+    closeButton.textContent = "Sakrij editor";
+    styleButton(closeButton);
+    closeButton.style.width = "100%";
+    closeButton.style.marginTop = "10px";
+
+    closeButton.addEventListener("click", () => {
+        root.style.display = "none";
+    });
+
+    root.append(
+        title,
+        addButton,
+        listTitle,
+        list,
+        status,
+        closeButton,
+        fileInput
+    );
+
+    document.body.appendChild(root);
+
+    state.editor = root;
+    state.modelList = list;
+    state.statusElement = status;
+    state.fileInput = fileInput;
+
+    refreshModelList();
+}
+
+function styleButton(button) {
+    Object.assign(button.style, {
+        background: "#516499",
+        color: "white",
+        border: "0",
+        borderRadius: "7px",
+        padding: "9px",
+        cursor: "pointer",
+        fontWeight: "bold"
+    });
+}
+
+function refreshModelList() {
+    if (!state.modelList) return;
+
+    state.modelList.innerHTML = "";
+
+    if (!state.models.length) {
+        const empty = document.createElement("div");
+        empty.textContent = "Nema učitanih modela.";
+        empty.style.color = "#aab3c7";
+        state.modelList.appendChild(empty);
+        return;
+    }
+
+    for (const model of state.models) {
+        const row = document.createElement("div");
+
+        Object.assign(row.style, {
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            padding: "7px 0",
+            borderBottom: "1px solid #3b4559"
+        });
+
+        const name = document.createElement("span");
+        name.textContent = model.name;
+        name.style.flex = "1";
+        name.style.overflowWrap = "anywhere";
+
+        const visibility = document.createElement("button");
+        visibility.textContent = model.visible ? "Hide" : "Show";
+        styleButton(visibility);
+
+        visibility.addEventListener("click", () => {
+            model.visible = !model.visible;
+            refreshModelList();
+        });
+
+        const remove = document.createElement("button");
+        remove.textContent = "×";
+        styleButton(remove);
+
+        remove.addEventListener("click", () => {
+            deleteModel(model.id);
+        });
+
+        row.append(name, visibility, remove);
+        state.modelList.appendChild(row);
+    }
+}
+
+function deleteModel(id) {
+    const index = state.models.findIndex(m => m.id === id);
+    if (index < 0) return;
+
+    const model = state.models[index];
+
+    if (state.gl) {
+        for (const gpu of model.gpu) {
+            state.gl.deleteBuffer(gpu.position);
+            state.gl.deleteBuffer(gpu.normal);
+            state.gl.deleteBuffer(gpu.uv);
+            state.gl.deleteBuffer(gpu.color);
+
+            if (gpu.texture) {
+                state.gl.deleteTexture(gpu.texture);
+            }
+        }
+    }
+
+    state.models.splice(index, 1);
+    refreshModelList();
+}
+
+/* =====================================================
+   TURBOWARP EXTENSION
+===================================================== */
+
+class ThreeDimensioner {
+    getInfo() {
+        return {
+            id: "threedimensioner",
+            name: "3Dimensioner",
+            color1: EXTENSION_COLOR,
+            color2: "#435783",
+            color3: "#344469",
+
+            blocks: [
+                {
+                    opcode: "setFPS",
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: "run code at fps of [FPS]",
+                    arguments: {
+                        FPS: {
+                            type: Scratch.ArgumentType.STRING,
+                            menu: "fpsMenu",
+                            defaultValue: "60"
+                        }
+                    }
+                },
+                {
+                    opcode: "hideModel",
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: "hide model [MODEL]",
+                    arguments: {
+                        MODEL: {
+                            type: Scratch.ArgumentType.STRING,
+                            menu: "modelMenu"
+                        }
+                    }
+                },
+                {
+                    opcode: "showModel",
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: "show model [MODEL]",
+                    arguments: {
+                        MODEL: {
+                            type: Scratch.ArgumentType.STRING,
+                            menu: "modelMenu"
+                        }
+                    }
+                },
+                {
+                    opcode: "setModelPos",
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: "set model [MODEL] pos to x [X] y [Y] z [Z]",
+                    arguments: {
+                        MODEL: {
+                            type: Scratch.ArgumentType.STRING,
+                            menu: "modelMenu"
+                        },
+                        X: { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+                        Y: { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+                        Z: { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 }
+                    }
+                },
+                {
+                    opcode: "setCameraPos",
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: "set camera pos to x [X] y [Y] z [Z]",
+                    arguments: {
+                        X: { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+                        Y: { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+                        Z: { type: Scratch.ArgumentType.NUMBER, defaultValue: 6 }
+                    }
+                },
+                {
+                    opcode: "setModelDir",
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: "set dir of model [MODEL] to x [X] y [Y] z [Z]",
+                    arguments: {
+                        MODEL: {
+                            type: Scratch.ArgumentType.STRING,
+                            menu: "modelMenu"
+                        },
+                        X: { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+                        Y: { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+                        Z: { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 }
+                    }
+                },
+                {
+                    opcode: "setCameraDir",
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: "set dir of camera to x [X] y [Y] z [Z]",
+                    arguments: {
+                        X: { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+                        Y: { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+                        Z: { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 }
+                    }
+                },
+                {
+                    opcode: "getPos",
+                    blockType: Scratch.BlockType.REPORTER,
+                    text: "pos of [OBJECT] [AXIS]",
+                    arguments: {
+                        OBJECT: {
+                            type: Scratch.ArgumentType.STRING,
+                            menu: "objectMenu"
+                        },
+                        AXIS: {
+                            type: Scratch.ArgumentType.STRING,
+                            menu: "axisMenu"
+                        }
+                    }
+                },
+                {
+                    opcode: "getDir",
+                    blockType: Scratch.BlockType.REPORTER,
+                    text: "dir of [OBJECT] [AXIS]",
+                    arguments: {
+                        OBJECT: {
+                            type: Scratch.ArgumentType.STRING,
+                            menu: "objectMenu"
+                        },
+                        AXIS: {
+                            type: Scratch.ArgumentType.STRING,
+                            menu: "axisMenu"
+                        }
+                    }
+                },
+                {
+                    opcode: "deleteObject",
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: "delete [OBJECT]",
+                    arguments: {
+                        OBJECT: {
+                            type: Scratch.ArgumentType.STRING,
+                            menu: "objectMenu"
+                        }
+                    }
+                }
+            ],
+
+            menus: {
+                fpsMenu: {
+                    acceptReporters: false,
+                    items: ["30", "60", "120", "200", "250"]
+                },
+                modelMenu: {
+                    acceptReporters: false,
+                    items: "getModelMenu"
+                },
+                objectMenu: {
+                    acceptReporters: false,
+                    items: "getObjectMenu"
+                },
+                axisMenu: {
+                    acceptReporters: false,
+                    items: ["x", "y", "z"]
+                }
+            }
+        };
+    }
+
+    getModelMenu() {
+        return state.models.length
+            ? state.models.map(m => m.name)
+            : ["No models"];
+    }
+
+    getObjectMenu() {
+        return ["camera", ...state.models.map(m => m.name)];
+    }
+
+    findModel(name) {
+        return state.models.find(m => m.name === String(name));
+    }
+
+    setFPS(args) {
+        const fps = Number(args.FPS);
+
+        if ([30, 60, 120, 200, 250].includes(fps)) {
+            state.fps = fps;
+            state.frameInterval = 1000 / fps;
+        }
+    }
+
+    hideModel(args) {
+        const model = this.findModel(args.MODEL);
+        if (model) {
+            model.visible = false;
+            refreshModelList();
+        }
+    }
+
+    showModel(args) {
+        const model = this.findModel(args.MODEL);
+        if (model) {
+            model.visible = true;
+            refreshModelList();
+        }
+    }
+
+    setModelPos(args) {
+        const model = this.findModel(args.MODEL);
+        if (!model) return;
+
+        model.x = num(args.X);
+        model.y = num(args.Y);
+        model.z = num(args.Z);
+    }
+
+    setCameraPos(args) {
+        state.camera.x = num(args.X);
+        state.camera.y = num(args.Y);
+        state.camera.z = num(args.Z);
+    }
+
+    setModelDir(args) {
+        const model = this.findModel(args.MODEL);
+        if (!model) return;
+
+        model.rx = num(args.X);
+        model.ry = num(args.Y);
+        model.rz = num(args.Z);
+    }
+
+    setCameraDir(args) {
+        state.camera.rx = num(args.X);
+        state.camera.ry = num(args.Y);
+        state.camera.rz = num(args.Z);
+    }
+
+    getPos(args) {
+        const axis = String(args.AXIS || "x").toLowerCase();
+
+        if (args.OBJECT === "camera") {
+            return num(state.camera[axis]);
+        }
+
+        const model = this.findModel(args.OBJECT);
+        return model ? num(model[axis]) : 0;
+    }
+
+    getDir(args) {
+        const axis = String(args.AXIS || "x").toLowerCase();
+
+        if (args.OBJECT === "camera") {
+            return num(state.camera["r" + axis]);
+        }
+
+        const model = this.findModel(args.OBJECT);
+        return model ? num(model["r" + axis]) : 0;
+    }
+
+    deleteObject(args) {
+        if (args.OBJECT === "camera") return;
+
+        const model = this.findModel(args.OBJECT);
+        if (model) deleteModel(model.id);
+    }
+}
+
+/* =====================================================
+   STARTUP
+===================================================== */
+
+createEditor();
+
+try {
+    setupRenderer();
+} catch (e) {
+    setStatus("Renderer: " + e.message);
+    console.error("[3Dimensioner]", e);
+}
+
+requestAnimationFrame(renderFrame);
+
+window.addEventListener("resize", resizeRenderer);
+
+Scratch.extensions.register(new ThreeDimensioner());
+
+})(Scratch);
